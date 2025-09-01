@@ -156,4 +156,3 @@ if st.button("開始掃描 / Scan", type="primary"):
     data = scan_month(month, year, max_workers, retry_window)
     render_table(data)
     st.success("完成。")
-
