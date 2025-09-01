@@ -1,73 +1,41 @@
-# ddv_ready.py — Louvre DDV 快速掃描
-# - 只查團體 DDV (GA)
-# - 只顯示週一/三/五/日
-# - 每一天失敗會 0.5–1 秒退避重試，直到 retry_window 秒
-# - 按「開始掃描」才會跑（不會 while 1 卡死）
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import streamlit as st
+import requests
+import pandas as pd
 from datetime import datetime
-import time, random, json
-import requests, pandas as pd, streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import json
 
-# ---------------- API ----------------
-API_ENDPOINT = "https://www.ticketlouvre.fr/louvre/api/RemotingService.cfc?method=doJson"
+# ------------------ 設定 ------------------
+API_ENDPOINT = "https://www.ticketlouvre.fr/louvre/b2c/RemotingService.cfc?method=doJson"
 
-
-# DDV (GA) 參數（固定）
-DDV_ONLY = {
-    "eventCode": "GA",
-    "performanceId": "720553",
-    "performanceAk": "LVR.EVN21.PRF116669",
-    "priceTableId": "1",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": "https://www.ticketlouvre.fr",
+    "Referer": "https://www.ticketlouvre.fr/",
+    "Connection": "keep-alive",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8,zh-TW;q=0.7",
 }
 
-# 只查：週一(0)／三(2)／五(4)／日(6)
-TARGET_WEEKDAYS = {0, 2, 4, 6}
+DDV_CONFIG = {
+    "eventCode": "GA",
+    "performanceId": "720553",
+    "priceTableId": "1",
+    "performanceAk": "LVR.EVN21.PRF116669",
+}
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="Louvre DDV Tickets", layout="wide")
-st.title("🎟️ Louvre – Droit de visite (DDV)")
+TARGET_WEEKDAYS = [0, 2, 4, 6]  # 週一/三/五/日
 
-ak = DDV_ONLY["performanceAk"]
-ak_mask = (ak[:6] + "..." + ak[-4:]) if len(ak) > 10 else ak
-st.caption(
-    f"eventCode={DDV_ONLY['eventCode']} • performanceId={DDV_ONLY['performanceId']} "
-    f"• priceTableId={DDV_ONLY['priceTableId']} • performanceAk={ak_mask}"
-)
-
-now = datetime.now()
-m_list = [now.month, (now.month % 12) + 1, ((now.month + 1) % 12) + 1, ((now.month + 2) % 12) + 1]
-months = sorted(set(m_list))
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    month = st.selectbox("選擇月份 / Month", months, index=0)
-with c2:
-    max_workers = st.slider("並行數 / Concurrency", 5, 40, 10, 1)
-with c3:
-    retry_window = st.selectbox("重試時間（秒）", [60, 120, 180, 300], index=1)  # 預設 120
-
-# ---------------- HTTP ----------------
-def new_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://www.ticketlouvre.fr",
-        "Referer": "https://www.ticketlouvre.fr/",
-        "Connection": "keep-alive",
-        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8,zh-TW;q=0.7",
-    })
-    return s
-
+# ------------------ 工具 ------------------
 def post_form(session: requests.Session, form: dict) -> dict:
-    r = session.post(API_ENDPOINT, data=form, timeout=15)
+    """統一送出 POST 請求，加上 headers"""
+    r = session.post(API_ENDPOINT, data=form, headers=HEADERS, timeout=15)
+
     if r.status_code >= 400:
-        # 降級重試一次
-        h = session.headers.copy()
-        h.pop("Origin", None); h.pop("Referer", None); h.pop("Accept-Language", None)
-        r = session.post(API_ENDPOINT, data=form, headers=h, timeout=15)
+        downgraded = {k: v for k, v in HEADERS.items() if k not in ("Origin", "Referer")}
+        r = session.post(API_ENDPOINT, data=form, headers=downgraded, timeout=15)
 
     if r.status_code >= 400:
         return {"__http_error__": True, "status": r.status_code, "text": r.text[:500]}
@@ -77,47 +45,48 @@ def post_form(session: requests.Session, form: dict) -> dict:
     except Exception:
         return json.loads(r.text)
 
-# ---------------- 邏輯 ----------------
-def fetch_date_list(session: requests.Session, year: int, month: int):
+
+def fetch_date_list(session: requests.Session, cfg: dict, month: int, year: int):
     form = {
         "eventName": "date.list.nt",
-        "year": year,
+        "eventCode": cfg["eventCode"],
+        "eventAk": cfg["performanceAk"].split(".PRF")[0],  # eventAk 不要用 PRF 那段
         "month": month,
-        "eventCode": "GA",
-        "eventAk": "LVR.EVN21",
+        "year": year,
     }
-    data = post_form(session, form)
-    if isinstance(data, dict) and data.get("__http_error__"):
-        return data
-    return data.get("api", {}).get("result", {}).get("dateList", []) or []
+    return post_form(session, form).get("api", {}).get("result", {}).get("dateList", [])
 
-def fetch_timeslots_with_retry(session: requests.Session, date_str: str, retry_seconds: int):
-    form = {"eventName": "ticket.list", "dateFrom": date_str, **DDV_ONLY}
+
+def fetch_timeslots_with_retry(session, cfg, date: str, retry_seconds: int):
+    form = {
+        "eventName": "ticket.list",
+        "dateFrom": date,
+        "eventCode": cfg["eventCode"],
+        "performanceId": cfg["performanceId"],
+        "priceTableId": cfg["priceTableId"],
+        "performanceAk": cfg["performanceAk"],
+    }
+
     deadline = time.time() + retry_seconds
     while time.time() < deadline:
         data = post_form(session, form)
-        if isinstance(data, dict) and data.get("__http_error__"):
-            time.sleep(random.uniform(0.5, 1.0))
-            continue
+        if "__http_error__" not in data:
+            try:
+                products = data["api"]["result"]["product.list"]
+                if products and products[0]["available"] > 0:
+                    return [f"{products[0]['available']} places"]
+                else:
+                    return []
+            except Exception:
+                return []
+        time.sleep(0.5)
+    return []
 
-        products = data.get("api", {}).get("result", {}).get("product", []) \
-                   or data.get("api", {}).get("result", {}).get("product.list", [])
-        slots = []
-        for p in products:
-            t = p.get("time") or p.get("startTime") or p.get("start_time")
-            if t:
-                slots.append(str(t))
-        return date_str, sorted(slots)
 
-    return date_str, []  # 超時
+def scan_month(cfg: dict, month: int, year: int, max_workers: int, retry_seconds: int):
+    session = requests.Session()
+    all_dates = fetch_date_list(session, cfg, month, year)
 
-def scan_month(month: int, year: int, max_workers: int, retry_seconds: int):
-    session = new_session()
-    all_dates = fetch_date_list(session, year, month)
-    if isinstance(all_dates, dict) and all_dates.get("__http_error__"):
-        return all_dates
-
-    # 過濾週一/三/五/日
     date_strs = [
         d["date"] for d in all_dates
         if datetime.strptime(d["date"], "%Y-%m-%d").weekday() in TARGET_WEEKDAYS
@@ -125,35 +94,40 @@ def scan_month(month: int, year: int, max_workers: int, retry_seconds: int):
 
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(fetch_timeslots_with_retry, session, ds, retry_seconds) for ds in date_strs]
+        futs = [ex.submit(fetch_timeslots_with_retry, session, cfg, ds, retry_seconds) for ds in date_strs]
         for fut in as_completed(futs):
-            d, slots = fut.result()
-            results[d] = slots
+            idx = futs.index(fut)
+            d = date_strs[idx]
+            results[d] = fut.result()
     return results
 
-def render_table(data: dict):
-    if isinstance(data, dict) and data.get("__http_error__"):
-        st.error(f"HTTP {data['status']} – {data['text']}")
-        return
 
+def render_table(data: dict):
     rows = []
     for d, slots in sorted(data.items()):
         wk = "一二三四五六日"[datetime.strptime(d, "%Y-%m-%d").weekday()]
         rows.append({
             "日期": f"{d} (週{wk})",
             "狀態": "✅ 有" if slots else "❌ 無",
-            "時段": "、".join(slots) or "-"
+            "時段": " / ".join(slots) if slots else "-"
         })
+
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.info("這個月份（僅週一／三／五／日）目前查不到可售日期或時段。")
+        st.info("這個月份 (週一/三/五/日) 沒有找到可售日期或時段。")
 
-# ---------------- RUN ----------------
-year = now.year if month >= now.month else (now.year + 1)
+
+# ------------------ UI ------------------
+st.title("🎫 Louvre – Droit de visite (DDV) (週一/三/五/日)")
+
+now = datetime.now()
+month = st.selectbox("選擇月份 / Month", [now.month, now.month + 1, now.month + 2, now.month + 3])
+concurrency = st.slider("並行數 / Concurrency", 4, 20, 10)
+retry_window = st.selectbox("重試時間 (秒)", [60, 120, 180], index=1)
 
 if st.button("開始掃描 / Scan", type="primary"):
     st.info("查詢中：並行請求 + 自動重試…")
-    data = scan_month(month, year, max_workers, retry_window)
+    data = scan_month(DDV_CONFIG, month, now.year, concurrency, retry_window)
     render_table(data)
     st.success("完成。")
