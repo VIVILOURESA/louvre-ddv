@@ -10,7 +10,8 @@ import time, random, json
 import requests, pandas as pd, streamlit as st
 
 # ---------------- API ----------------
-API_ENDPOINT = "https://www.ticketlouvre.fr/louvre/b2c/RemotingService.cfc?method=doJson"
+API_ENDPOINT = "https://www.ticketlouvre.fr/louvre/api/RemotingService.cfc?method=doJson"
+
 
 # DDV (GA) 參數（固定）
 DDV_ONLY = {
